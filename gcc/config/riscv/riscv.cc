@@ -12420,6 +12420,10 @@ riscv_override_options_internal (struct gcc_options *opts)
 		 ? &optimize_size_tune_info
 		 : cpu->tune_param;
 
+  if (!OPTION_SET_P (flag_riscv_pair_fusion))
+    opts->x_flag_riscv_pair_fusion
+      = cpu->tune_param == &xt_c9501_tune_info;
+
   /* If not optimizing for size, set the default
       alignment to what the target wants.  */
   if (!opts->x_optimize_size)
