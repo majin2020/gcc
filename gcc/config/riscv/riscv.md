@@ -5514,6 +5514,7 @@
 (include "mips-insn.md")
 (include "sfb.md")
 (include "zc.md")
+(include "pair-fusion.md")
 ;; Vendor extensions
 (include "thead.md")
 (include "corev.md")
