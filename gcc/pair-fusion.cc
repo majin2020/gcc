@@ -113,6 +113,13 @@ pair_fusion::pair_fusion ()
 
 pair_fusion::~pair_fusion ()
 {
+  // Process later regions first, since an earlier region can move the
+  // instruction immediately preceding a later region's insertion point.
+  if (m_groups.length () > 1)
+    std::sort (m_groups.begin (), m_groups.end (),
+	       [](const insn_group &a, const insn_group &b)
+	       { return *a.order > *b.order; });
+
   if (crtl->ssa->perform_pending_updates ())
     cleanup_cfg (0);
 
@@ -120,6 +127,51 @@ pair_fusion::~pair_fusion ()
 
   delete crtl->ssa;
   crtl->ssa = nullptr;
+
+  // The disjoint groups were checked against the original SSA graph.
+  // Apply them only after releasing it, then recompute liveness notes.
+  for (const auto &group : m_groups)
+    {
+      rtx_insn *end = NEXT_INSN (group.last);
+      for (rtx_insn *insn = group.first; insn != end;
+	   insn = NEXT_INSN (insn))
+	if (DEBUG_BIND_INSN_P (insn))
+	  {
+	    INSN_VAR_LOCATION_LOC (insn) = gen_rtx_UNKNOWN_VAR_LOC ();
+	    df_insn_rescan (insn);
+	  }
+
+      rtx_insn *first = group.reverse ? group.last : group.first;
+      rtx_insn *second = group.reverse ? group.first : group.last;
+      if (PREV_INSN (first) != group.after)
+	reorder_insns (first, first, group.after);
+      if (PREV_INSN (second) != first)
+	reorder_insns (second, second, first);
+    }
+
+  if (!m_groups.is_empty ())
+    {
+      df_note_add_problem ();
+      df_analyze ();
+    }
+}
+
+void
+pair_fusion::queue_group (insn_info *insns[2], bool reverse, insn_info *after)
+{
+  if (!reverse && next_nonnote_nondebug_insn (insns[0]->rtl ())
+		  == insns[1]->rtl ())
+    return;
+
+  rtx_insn *anchor = after->rtl ();
+  while (anchor == insns[0]->rtl () || anchor == insns[1]->rtl ())
+    anchor = PREV_INSN (anchor);
+  m_groups.safe_push ({ insns[0], insns[0]->rtl (), insns[1]->rtl (),
+		       anchor, reverse });
+  if (dump_file)
+    fprintf (dump_file, "moving scalar pair (%d,%d) after %d\n",
+	     insns[reverse]->uid (), insns[!reverse]->uid (),
+	     INSN_UID (anchor));
 }
 
 // This is the main function to start the pass.
@@ -187,6 +239,8 @@ private:
   bitmap_head m_tombstone_bitmap;
   bool m_emitted_tombstone;
 
+  auto_bitmap m_grouped_insns;
+
   inline splay_tree_node<access_record *> *node_alloc (access_record *);
 
   template<typename Map>
@@ -208,6 +262,8 @@ private:
   inline void track_tombstone (int uid);
 
   inline bool track_via_mem_expr (insn_info *, rtx mem, lfs_fields lfs);
+  bool prepare_group (insn_info *insns[2], bool descending_p,
+		      bool &reverse);
 };
 
 splay_tree_node<access_record *> *
@@ -313,19 +369,19 @@ static int
 encode_lfs (lfs_fields fields)
 {
   int size_log2 = exact_log2 (fields.size);
-  gcc_checking_assert (size_log2 >= 2 && size_log2 <= 4);
-  return ((int)fields.load_p << 3)
-    | ((int)fields.fpsimd_p << 2)
-    | (size_log2 - 2);
+  gcc_checking_assert (size_log2 >= 0 && size_log2 <= 4);
+  return ((int)fields.load_p << 4)
+    | ((int)fields.fpsimd_p << 3)
+    | size_log2;
 }
 
 // Inverse of encode_lfs.
 static lfs_fields
 decode_lfs (int lfs)
 {
-  bool load_p = (lfs & (1 << 3));
-  bool fpsimd_p = (lfs & (1 << 2));
-  unsigned size = 1U << ((lfs & 3) + 2);
+  bool load_p = (lfs & (1 << 4));
+  bool fpsimd_p = (lfs & (1 << 3));
+  unsigned size = 1U << (lfs & 7);
   return { load_p, fpsimd_p, size };
 }
 
@@ -447,7 +503,7 @@ pair_fusion_bb_info::track_access (insn_info *insn, bool load_p, rtx mem)
   const unsigned mem_size = GET_MODE_SIZE (mem_mode).to_constant ();
   const lfs_fields lfs = { load_p, fpsimd_op_p, mem_size };
 
-  if (track_via_mem_expr (insn, mem, lfs))
+  if (!m_pass->keep_separate_p () && track_via_mem_expr (insn, mem, lfs))
     return;
 
   poly_int64 mem_off;
@@ -2472,10 +2528,15 @@ pair_fusion::get_viable_bases (insn_info *insns[2],
   if (base_defs[0] && base_defs[1]
       && base_defs[0]->regno () == base_defs[1]->regno ())
     {
+      if (keep_separate_p () && base_defs[0] != base_defs[1])
+	return writeback;
       // Easy case: insns already share the same base reg.
       base_cands.quick_push (base_defs[0]);
       return writeback;
     }
+
+  if (keep_separate_p ())
+    return writeback;
 
   // Otherwise, we know that one of the bases must change.
   //
@@ -2486,6 +2547,68 @@ pair_fusion::get_viable_bases (insn_info *insns[2],
       base_cands.quick_push (base_cand { base_defs[i], i });
 
   return writeback;
+}
+
+// Check that the scalar pair has a disjoint motion region.  Keeping regions
+// disjoint lets all searches use one unchanged RTL-SSA graph.  DESCENDING_P
+// says whether the instructions are already in descending address order.
+bool
+pair_fusion_bb_info::prepare_group (insn_info *insns[2], bool descending_p,
+				    bool &reverse)
+{
+  if (cfun->can_throw_non_call_exceptions)
+    return false;
+
+  rtx_insn *first = insns[0]->rtl ();
+  rtx_insn *last = insns[1]->rtl ();
+  // Match the target's preferred address order when it is legal.
+  reverse = false;
+  if (m_pass->prefer_descending_p () && !descending_p
+      && m_pass->pair_fusible_p (last, first))
+    reverse = true;
+  else if (!m_pass->pair_fusible_p (first, last))
+    {
+      if (!m_pass->pair_fusible_p (last, first))
+	return false;
+      reverse = true;
+    }
+
+  if (reverse)
+    for (unsigned i = 0; i < 2; ++i)
+      for (auto def : insns[i]->defs ())
+	if (def->is_reg ()
+	    && refers_to_regno_p (def->regno (), def->regno () + 1,
+				  PATTERN (insns[!i]->rtl ()), nullptr))
+	  return false;
+
+  unsigned count = 0;
+  rtx_insn *end = NEXT_INSN (last);
+  for (rtx_insn *insn = first; insn != end; insn = NEXT_INSN (insn))
+    {
+      if (NOTE_P (insn))
+	{
+	  if (NOTE_KIND (insn) == NOTE_INSN_CFI
+	      || NOTE_KIND (insn) == NOTE_INSN_PROLOGUE_END
+	      || NOTE_KIND (insn) == NOTE_INSN_EPILOGUE_BEG)
+	    return false;
+	  continue;
+	}
+      if (DEBUG_INSN_P (insn))
+	continue;
+      if (!NONJUMP_INSN_P (insn)
+	  || ++count > m_pass->pair_reorder_limit ()
+	  || RTX_FRAME_RELATED_P (insn)
+	  || SCHED_GROUP_P (insn)
+	  || volatile_insn_p (PATTERN (insn))
+	  || asm_noperands (PATTERN (insn)) >= 0
+	  || find_reg_note (insn, REG_EH_REGION, NULL_RTX)
+	  || find_reg_note (insn, REG_ARGS_SIZE, NULL_RTX)
+	  || bitmap_bit_p (m_grouped_insns, INSN_UID (insn)))
+	return false;
+    }
+
+  rtx_insn *next = next_nonnote_nondebug_insn (last);
+  return !next || !INSN_P (next) || !SCHED_GROUP_P (next);
 }
 
 // Given two adjacent memory accesses of the same size, I1 and I2, try
@@ -2515,6 +2638,11 @@ pair_fusion_bb_info::try_fuse_pair (bool load_p, unsigned access_size,
       reversed = true;
     }
 
+  bool reverse_group = false;
+  if (m_pass->keep_separate_p ()
+      && !prepare_group (insns, reversed, reverse_group))
+    return false;
+
   rtx cand_mems[2];
   rtx reg_ops[2];
   rtx pats[2];
@@ -2522,6 +2650,9 @@ pair_fusion_bb_info::try_fuse_pair (bool load_p, unsigned access_size,
     {
       pats[i] = PATTERN (insns[i]->rtl ());
       cand_mems[i] = XEXP (pats[i], load_p);
+      if (load_p && (GET_CODE (cand_mems[i]) == SIGN_EXTEND
+		     || GET_CODE (cand_mems[i]) == ZERO_EXTEND))
+	cand_mems[i] = XEXP (cand_mems[i], 0);
       reg_ops[i] = XEXP (pats[i], !load_p);
     }
 
@@ -2841,6 +2972,22 @@ pair_fusion_bb_info::try_fuse_pair (bool load_p, unsigned access_size,
 	       range.first->uid (), range.last->uid ());
     }
 
+  if (m_pass->keep_separate_p ())
+    {
+      gcc_assert (!writeback && base->from_insn == -1);
+      for (auto insn = insns[0];; insn = insn->next_nondebug_insn ())
+	{
+	  bitmap_set_bit (m_grouped_insns, insn->uid ());
+	  if (insn == insns[1])
+	    break;
+	}
+      m_pass->queue_group (insns, reverse_group, range.first);
+      if (dump_file)
+	fprintf (dump_file, "grouped scalar pair (%d,%d)\n",
+		 insns[reverse_group]->uid (), insns[!reverse_group]->uid ());
+      return true;
+    }
+
   return fuse_pair (load_p, access_size, writeback,
 		    i1, i2, *base, range);
 }
@@ -3138,13 +3285,17 @@ void pair_fusion::process_block (bb_info *bb)
 	  && pair_mem_insn_p (rti, load_p))
 	try_promote_writeback (insn, load_p);
 
-      if (GET_CODE (pat) != SET)
+      if (GET_CODE (pat) != SET || !pair_mem_candidate_p (rti))
 	continue;
 
+      rtx src = SET_SRC (pat);
+      if (keep_separate_p ()
+	  && (GET_CODE (src) == SIGN_EXTEND || GET_CODE (src) == ZERO_EXTEND))
+	src = XEXP (src, 0);
       if (track_stores && MEM_P (XEXP (pat, 0)))
 	bb_state.track_access (insn, false, XEXP (pat, 0));
-      else if (track_loads && MEM_P (XEXP (pat, 1)))
-	bb_state.track_access (insn, true, XEXP (pat, 1));
+      else if (track_loads && MEM_P (src))
+	bb_state.track_access (insn, true, src);
     }
 
   bb_state.transform ();

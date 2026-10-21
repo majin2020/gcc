@@ -93,6 +93,34 @@ enum class writeback_type {
 struct pair_fusion {
   pair_fusion ();
 
+  // Return true to retain the scalar instructions and group them for
+  // macro fusion, rather than generating a paired memory instruction.
+  virtual bool keep_separate_p ()
+  {
+    return false;
+  }
+
+  // Return whether an instruction is eligible for the pair search.
+  virtual bool pair_mem_candidate_p (rtx_insn *)
+  {
+    return true;
+  }
+  // In scalar mode, return whether two instructions fuse in this order.
+  virtual bool pair_fusible_p (rtx_insn *, rtx_insn *)
+  {
+    return false;
+  }
+  // Prefer the higher address first when both pair orders are fusible.
+  virtual bool prefer_descending_p ()
+  {
+    return false;
+  }
+  // Maximum number of nondebug instructions in a scalar pair's region.
+  virtual unsigned pair_reorder_limit ()
+  {
+    return 64;
+  }
+
   // Given:
   // - an rtx REG_OP, the non-memory operand in a load/store insn,
   // - a machine_mode MEM_MODE, the mode of the MEM in that insn, and
@@ -192,4 +220,19 @@ struct pair_fusion {
   void try_promote_writeback (rtl_ssa::insn_info *insn, bool load_p);
   void run ();
   ~pair_fusion ();
+
+  void queue_group (rtl_ssa::insn_info *insns[2], bool reverse,
+		    rtl_ssa::insn_info *after);
+
+private:
+  struct insn_group
+  {
+    rtl_ssa::insn_info *order;
+    rtx_insn *first;
+    rtx_insn *last;
+    rtx_insn *after;
+    bool reverse;
+  };
+
+  auto_vec<insn_group> m_groups;
 };

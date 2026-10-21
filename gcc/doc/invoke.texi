@@ -1338,7 +1338,7 @@ See RS/6000 and PowerPC Options.
 -mcpu=@var{processor-string}  -mtune=@var{processor-string}
 -mpreferred-stack-boundary=@var{num}
 -msmall-data-limit=@var{N-bytes}
--msave-restore  -mno-shorten-memrefs
+-msave-restore  -mno-shorten-memrefs  -mpair-fusion
 -mstrict-align  -mscalar-strict-align  -mno-vector-strict-align
 -mzilsd-word-align  -mzilsd-strict-align
 -mcmodel=medlow  -mcmodel=medany  -mcmodel=large
@@ -31603,6 +31603,26 @@ replacing a load/store of 'base register + large offset' with a new load/store
 of 'new base + small offset'.  If the new base gets stored in a compressed
 register, then the new load/store can be compressed.  Currently targets 32-bit
 integer load/stores only.
+
+@opindex mpair-fusion
+@opindex mno-pair-fusion
+@item -mpair-fusion
+@itemx -mno-pair-fusion
+Enable or disable grouping scalar loads and stores for macro fusion after
+register allocation and before the second instruction scheduling pass.
+The selected tuning processor must support memory pair fusion.  The two
+scalar instructions are retained.  This option is disabled by default and
+is independent of @option{-fschedule-fusion}.  It has no effect with
+@option{-O0}, @option{-Og}, @option{-fselective-scheduling2}, or in functions
+that can throw non-call exceptions.
+
+@item --param=riscv-pair-fusion-alias-check-limit=@var{n}
+Limit alias checks when considering a memory fusion pair.  The default is 8.
+
+@item --param=riscv-pair-fusion-max-insns=@var{n}
+Limit the span of a memory fusion pair to @var{n} nondebug instructions,
+including both candidates.  The default is 64.  The pass selects pairs
+with disjoint instruction spans within each basic block.
 
 @opindex mstrict-align
 @opindex mno-strict-align
