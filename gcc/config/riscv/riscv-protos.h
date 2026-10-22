@@ -215,6 +215,7 @@ rtl_opt_pass * make_pass_insert_landing_pad (gcc::context *ctxt);
 rtl_opt_pass * make_pass_vector_permconst (gcc::context *ctxt);
 rtl_opt_pass * make_pass_bclr_lowest_set_bit (gcc::context *ctxt);
 rtl_opt_pass * make_pass_combine_popretz (gcc::context *ctxt);
+rtl_opt_pass *make_pass_riscv_pair_fusion (gcc::context *ctxt);
 
 /* Routines implemented in riscv-vsetvl.cc.  */
 extern bool has_vtype_op (rtx_insn *);
@@ -887,6 +888,8 @@ enum riscv_fusion_pairs
 
 extern bool riscv_macro_fusion_p (void);
 extern bool riscv_macro_fusion_pair_p (rtx_insn *, rtx_insn *);
+extern bool riscv_mem_pair_candidate_p (rtx_insn *);
+extern bool riscv_mem_pair_p (rtx_insn *, rtx_insn *);
 extern unsigned HOST_WIDE_INT riscv_get_fusible_ops (void);
 
 /* Routines implemented in thead.cc.  */

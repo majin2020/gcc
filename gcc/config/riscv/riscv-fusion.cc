@@ -1970,6 +1970,57 @@ static const struct riscv_fusion_entry riscv_fusion_table[] =
     riscv_fuse_logic_logic, "RISCV_FUSE_LOGIC_LOGIC" },
 };
 
+/* Return whether INSN can participate in an enabled memory pair.  */
+
+bool
+riscv_mem_pair_candidate_p (rtx_insn *insn)
+{
+  riscv_fusion_mem_info mem;
+  if (!riscv_fuse_mem_p (insn, &mem)
+      || mem.addr.type != ADDRESS_REG
+      || !CONST_INT_P (mem.addr.offset)
+      || !REG_P (mem.addr.reg)
+      || !HARD_REGISTER_P (mem.addr.reg))
+    return false;
+
+  unsigned HOST_WIDE_INT ops = riscv_get_fusible_ops ();
+  poly_uint64 size = GET_MODE_SIZE (mem.mode);
+  bool pair_width_p = known_eq (size, 4U) || known_eq (size, 8U);
+  if (mem.fp_p)
+    return (pair_width_p
+	    && mem.type != SCHED_FUSION_LD_ZERO_EXTEND
+	    && (ops & (RISCV_FUSE_FLDFST_PAIR_INC
+		       | RISCV_FUSE_FLDFST_PAIR_DEC)));
+
+  if (mem.type == SCHED_FUSION_ST
+      && (ops & RISCV_FUSE_ALIGNED_STD)
+      && SCALAR_INT_MODE_P (mem.mode)
+      && (known_eq (size, 1U) || known_eq (size, 2U)
+	  || pair_width_p))
+    return true;
+
+  return (pair_width_p
+	  && mem.type != SCHED_FUSION_LD_ZERO_EXTEND
+	  && (ops & (RISCV_FUSE_LDST_PAIR_INC
+		     | RISCV_FUSE_LDST_PAIR_DEC)));
+}
+
+/* Return whether PREV and CURR match an enabled memory pair.  */
+
+bool
+riscv_mem_pair_p (rtx_insn *prev, rtx_insn *curr)
+{
+  const unsigned HOST_WIDE_INT pair_ops
+    = (RISCV_FUSE_ALIGNED_STD
+       | RISCV_FUSE_LDST_PAIR_INC | RISCV_FUSE_LDST_PAIR_DEC
+       | RISCV_FUSE_FLDFST_PAIR_INC | RISCV_FUSE_FLDFST_PAIR_DEC);
+  unsigned HOST_WIDE_INT enabled = riscv_get_fusible_ops () & pair_ops;
+  for (const riscv_fusion_entry &entry : riscv_fusion_table)
+    if ((enabled & entry.op) && entry.checker (prev, curr))
+      return true;
+  return false;
+}
+
 /* Implement TARGET_SCHED_MACRO_FUSION_PAIR_P.  Return true if PREV and CURR
    should be kept together during scheduling.  */
 
